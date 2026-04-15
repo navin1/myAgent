@@ -26,6 +26,18 @@ def _get_conn() -> duckdb.DuckDBPyConnection:
     return _conn
 
 
+def _read_bq_table_name(file_path: Path) -> str | None:
+    """Read raw [Row 1, Col 1] as the BigQuery target table name before header rows are skipped."""
+    try:
+        raw = pd.read_excel(file_path, header=None, nrows=1, engine="openpyxl")
+        val = raw.iloc[0, 0]
+        if pd.notna(val):
+            return str(val).strip() or None
+    except Exception:
+        pass
+    return None
+
+
 def _make_table_name(file_path: Path, sheet_name: str, base_path: Path) -> str:
     """Derive a stable, SQL-safe table name from the relative file path + sheet."""
     rel = file_path.relative_to(base_path)
@@ -95,7 +107,15 @@ def load_excel_files() -> dict[str, Any]:
     _registry.clear()
     loaded, errors = 0, []
 
-    header_arg: int | list[int] = (
+    # Resolve mapping/master folder roots for per-file header and folder-name logic
+    mapping_root: Path | None = None
+    if settings.EXCEL_MAPPING_PATH:
+        mp = Path(settings.EXCEL_MAPPING_PATH).expanduser().resolve()
+        if mp.exists():
+            mapping_root = mp
+
+
+    master_header_arg: int | list[int] = (
         list(range(settings.EXCEL_HEADER_ROWS)) if settings.EXCEL_HEADER_ROWS > 1 else 0
     )
 
@@ -104,6 +124,19 @@ def load_excel_files() -> dict[str, Any]:
         excel_files.extend(sorted(base_path.rglob(ext)))
 
     for file_path in excel_files:
+        is_mapping = bool(mapping_root and file_path.is_relative_to(mapping_root))
+
+        if is_mapping:
+            # EXCEL_MAPPING_HEADER_ROWS is a 1-indexed offset: skip rows 1..(n-1),
+            # use row n as the column header.
+            header_arg: int | list[int] = settings.EXCEL_MAPPING_HEADER_ROWS - 1
+            bq_table_name = _read_bq_table_name(file_path)
+        else:
+            header_arg = master_header_arg
+            bq_table_name = None
+
+        folder = file_path.parent.name
+
         try:
             sheets: dict[str, pd.DataFrame] = pd.read_excel(
                 file_path, sheet_name=None, header=header_arg, engine="openpyxl"
@@ -114,12 +147,16 @@ def load_excel_files() -> dict[str, Any]:
                 rel_path = str(file_path.relative_to(base_path))
 
                 conn.register(table_name, df)
-                _registry[table_name] = {
+                entry: dict[str, Any] = {
                     "file": rel_path,
                     "sheet": sheet_name,
+                    "folder": folder,
                     "rows": len(df),
                     "columns": list(df.columns),
                 }
+                if bq_table_name is not None:
+                    entry["bq_table_name"] = bq_table_name
+                _registry[table_name] = entry
                 loaded += 1
                 log.info(
                     "Loaded Excel: %s → sheet '%s' as table '%s' (%d rows, %d cols)",
@@ -130,11 +167,37 @@ def load_excel_files() -> dict[str, Any]:
             log.warning("Failed to load %s: %s", rel, exc)
             errors.append({"file": rel, "error": str(exc)})
 
+    _build_meta_registry_table(conn)
     _loaded = True
     result: dict[str, Any] = {"loaded": loaded}
     if errors:
         result["errors"] = errors
     return result
+
+
+def _build_meta_registry_table(conn: duckdb.DuckDBPyConnection) -> None:
+    """Materialise _registry as a queryable DuckDB table __meta_excel_registry."""
+    rows = [
+        {
+            "duckdb_table":  tbl,
+            "excel_file":    info["file"],
+            "sheet":         info["sheet"],
+            "folder":        info.get("folder"),
+            "bq_table_name": info.get("bq_table_name"),
+            "row_count":     info["rows"],
+            "columns":       ", ".join(info["columns"]),
+        }
+        for tbl, info in _registry.items()
+    ]
+    meta_df = pd.DataFrame(rows, columns=[
+        "duckdb_table", "excel_file", "sheet", "folder",
+        "bq_table_name", "row_count", "columns",
+    ])
+    conn.execute("DROP TABLE IF EXISTS __meta_excel_registry")
+    conn.register("__meta_df_tmp", meta_df)
+    conn.execute("CREATE TABLE __meta_excel_registry AS SELECT * FROM __meta_df_tmp")
+    conn.unregister("__meta_df_tmp")
+    log.info("Built __meta_excel_registry with %d entries", len(rows))
 
 
 def _ensure_loaded() -> None:
@@ -162,17 +225,18 @@ def list_excel_files() -> dict[str, Any]:
 def list_excel_tables() -> dict[str, Any]:
     """Return every queryable table with its columns and source citation."""
     _ensure_loaded()
-    return {
-        "tables": [
-            {
-                "table": name,
-                "citation": {"file": info["file"], "sheet": info["sheet"]},
-                "rows": info["rows"],
-                "columns": info["columns"],
-            }
-            for name, info in _registry.items()
-        ]
-    }
+    tables = []
+    for name, info in _registry.items():
+        entry: dict[str, Any] = {
+            "table": name,
+            "citation": {"file": info["file"], "sheet": info["sheet"]},
+            "rows": info["rows"],
+            "columns": info["columns"],
+        }
+        if "bq_table_name" in info:
+            entry["bq_table_name"] = info["bq_table_name"]
+        tables.append(entry)
+    return {"tables": tables}
 
 
 def get_excel_schema(table_name: str) -> dict[str, Any]:
@@ -184,12 +248,15 @@ def get_excel_schema(table_name: str) -> dict[str, Any]:
             "available_tables": list(_registry.keys()),
         }
     info = _registry[table_name]
-    return {
+    result: dict[str, Any] = {
         "table": table_name,
         "citation": {"file": info["file"], "sheet": info["sheet"]},
         "columns": info["columns"],
         "rows": info["rows"],
     }
+    if "bq_table_name" in info:
+        result["bq_table_name"] = info["bq_table_name"]
+    return result
 
 
 def query_excel(sql: str) -> dict[str, Any]:

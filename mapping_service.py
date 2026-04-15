@@ -160,12 +160,30 @@ def _parse_sheet(
 # ---------------------------------------------------------------------------
 
 def _header_arg(file_type: str) -> int | list[int]:
-    """Return the pandas header= argument for a given file type."""
+    """Return the pandas header= argument for a given file type.
+
+    Mapping files: EXCEL_MAPPING_HEADER_ROWS is a 1-indexed row offset —
+    rows before it are skipped and that row becomes the single column header.
+
+    Master files: EXCEL_MASTER_HEADER_ROWS rows form a MultiIndex header.
+    """
     if file_type == "mapping":
-        n = settings.EXCEL_MAPPING_HEADER_ROWS
-    else:
-        n = settings.EXCEL_MASTER_HEADER_ROWS
+        return settings.EXCEL_MAPPING_HEADER_ROWS - 1  # 0-indexed header row
+    n = settings.EXCEL_MASTER_HEADER_ROWS
     return list(range(n)) if n > 1 else 0
+
+
+def _read_bq_table_name(file_path: Path) -> str | None:
+    """Read raw [Row 1, Col 1] as the BigQuery target table name before header rows are skipped."""
+    try:
+        import pandas as pd
+        raw = pd.read_excel(file_path, header=None, nrows=1, engine="openpyxl")
+        val = raw.iloc[0, 0]
+        if pd.notna(val):
+            return str(val).strip() or None
+    except Exception:
+        pass
+    return None
 
 
 def load_mapping_files() -> dict[str, Any]:
@@ -237,6 +255,8 @@ def load_mapping_files() -> dict[str, Any]:
         header_arg = _header_arg(file_type)
 
         try:
+            bq_table_name = _read_bq_table_name(file_path) if file_type == "mapping" else None
+
             sheets: dict[str, pd.DataFrame] = pd.read_excel(
                 file_path, sheet_name=None, header=header_arg, engine="openpyxl"
             )
@@ -249,13 +269,16 @@ def load_mapping_files() -> dict[str, Any]:
                 for sheet_name, df in sheets.items()
             }
 
-            _index[norm_key] = {
+            entry: dict[str, Any] = {
                 "table_name": table_name,
                 "normalized_name": norm_key,
                 "file": rel_path,
                 "type": file_type,
                 "sheets": parsed_sheets,
             }
+            if bq_table_name is not None:
+                entry["bq_table_name"] = bq_table_name
+            _index[norm_key] = entry
             loaded += 1
             log.info(
                 "Indexed %s spec: %s → '%s' (%d sheet(s))",
@@ -306,6 +329,8 @@ def list_mapping_tables() -> dict[str, Any]:
             "sheets": list(v["sheets"].keys()),
         }
         if v["type"] == "mapping":
+            if "bq_table_name" in v:
+                entry["bq_table_name"] = v["bq_table_name"]
             total_pairs = sum(
                 s.get("mapped_columns", 0) for s in v["sheets"].values()
             )
