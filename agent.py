@@ -62,6 +62,29 @@ Rules:
 - Always cite the spec file in responses: [filename.xlsx — mapping spec]
 - source_target_pairs contains the ground truth for what the SQL must implement.""" if settings.EXCEL_DATA_PATH else ""
 
+_SCHEMA_AUDIT_SECTION = f"""
+## Schema Audit (MySQL → BigQuery reconciliation)
+Metadata project: {settings.SCHEMA_METADATA_PROJECT}
+
+Tool:
+- run_schema_audit(): reconcile MySQL source columns against live BigQuery view schemas.
+  Reads streamed tables from HEADER_VIEW/DETAIL_VIEW, fetches BQ schemas, and writes:
+    • schema_audit_<timestamp>_prd.xlsx  — prod tables (deployed_to_prod=1)
+    • schema_audit_<timestamp>_uat.xlsx  — UAT tables
+    • schema_ddl_<timestamp>_prd.json   — BQ DDL for prod tables
+    • schema_ddl_<timestamp>_uat.json   — BQ DDL for UAT tables
+  Output files are written to SCHEMA_AUDIT_OUTPUT_DIR (configured in .env).
+
+Status legend in the Excel report:
+  🟢 Match       — MySQL and BQ types are equivalent
+  🟡 Type Mismatch — types differ
+  🟠 BQ Only     — column exists in BQ but not in MySQL metadata
+  🔵 MySQL Only  — column exists in MySQL metadata but not in BQ
+
+Rules:
+- Call run_schema_audit() directly — no arguments needed.
+- Report the output file paths and the column-level counts from the result.""" if settings.SCHEMA_METADATA_PROJECT else ""
+
 _GCS_SECTION = """
 ## GCS File Access
 Tool (always available):
@@ -564,6 +587,7 @@ SYSTEM_PROMPT = "\n".join(filter(None, [
     _BQ_SECTION,
     _EXCEL_SECTION,
     _MAPPING_SECTION,
+    _SCHEMA_AUDIT_SECTION,
     _GCS_SECTION,
     _COMPOSER_SECTION,
     _AUDIT_SECTION,
@@ -660,6 +684,17 @@ if settings.EXCEL_DATA_PATH:
     _MAPPING_TOOLS: list = [list_mapping_tables, get_table_mapping]
 else:
     _MAPPING_TOOLS = []
+
+if settings.SCHEMA_METADATA_PROJECT:
+    import mapping_service as _mapping_service_audit
+
+    def run_schema_audit() -> dict[str, Any]:
+        """Reconcile MySQL source columns against live BigQuery view schemas and write Excel + DDL JSON reports. No arguments needed."""
+        return _mapping_service_audit.run_schema_audit()
+
+    _SCHEMA_AUDIT_TOOLS: list = [run_schema_audit]
+else:
+    _SCHEMA_AUDIT_TOOLS = []
 
 
 # ---------------------------------------------------------------------------
@@ -820,6 +855,7 @@ TOOLS = (
     [list_datasets, list_tables, get_table_schema, execute_sql, estimate_sql_cost]
     + _EXCEL_TOOLS
     + _MAPPING_TOOLS
+    + _SCHEMA_AUDIT_TOOLS
     + [read_gcs_path]
     + _GCS_TOOLS
     + _COMPOSER_TOOLS
