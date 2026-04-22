@@ -577,7 +577,7 @@ Step 4 — Report
 
 _GENERAL_RULES = """
 ## General rules
-- For query results: one-sentence intro then let the UI render the table — do not repeat rows in text.
+- For query results: write one sentence (e.g. "Found 42 rows.") — NEVER reproduce the rows or a markdown table in your text. The UI renders the full table automatically.
 - For schema: show verbatim in a ```json block; do not reformat.
 - For JSON output requests: return a ```json array of objects.
 - Always include citations for every piece of data returned."""
@@ -903,7 +903,12 @@ class MyAgent:
 
             fn_parts = [p for p in (model_content.parts or []) if p.function_call is not None]
             if not fn_parts:
-                result["text"] = response.text or ""
+                text = response.text or ""
+                # Strip markdown table lines — the UI renders dataframes; text must not duplicate them
+                if result["tables"]:
+                    lines = [l for l in text.split("\n") if not l.lstrip().startswith("|")]
+                    text = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+                result["text"] = text
                 break
 
             response_parts = []
