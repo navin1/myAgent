@@ -62,3 +62,25 @@ GIT_SQL_PATH   = os.getenv("GIT_SQL_PATH", "sql/")
 # Committer identity used when writing back optimised files.
 GIT_COMMIT_USER_NAME  = os.getenv("GIT_COMMIT_USER_NAME", "MyAgent")
 GIT_COMMIT_USER_EMAIL = os.getenv("GIT_COMMIT_USER_EMAIL", "dbconnect@example.com")
+
+# ── Schema Audit (MySQL → BigQuery reconciliation) ────────────────────────────
+# GCP project that hosts the HEADER_VIEW and DETAIL_VIEW metadata tables.
+SCHEMA_METADATA_PROJECT = os.getenv("SCHEMA_METADATA_PROJECT", GCP_PROJECT_ID)
+
+# BQ target projects — prod for deployed_to_prod=1, UAT for everything else.
+SCHEMA_BQ_PROJECT_PROD  = os.getenv("SCHEMA_BQ_PROJECT_PROD", "")
+SCHEMA_BQ_PROJECT_UAT   = os.getenv("SCHEMA_BQ_PROJECT_UAT",  SCHEMA_METADATA_PROJECT)
+
+# Fully-qualified BigQuery views for streamed-table metadata.
+# Defaults assume dataset raw_sls_v in SCHEMA_METADATA_PROJECT.
+SCHEMA_HEADER_VIEW = os.getenv(
+    "SCHEMA_HEADER_VIEW",
+    f"{SCHEMA_METADATA_PROJECT}.raw_sls_v.datstream_header_v" if SCHEMA_METADATA_PROJECT else "",
+)
+SCHEMA_DETAIL_VIEW = os.getenv(
+    "SCHEMA_DETAIL_VIEW",
+    f"{SCHEMA_METADATA_PROJECT}.raw_sls_v.datstream_detail_v" if SCHEMA_METADATA_PROJECT else "",
+)
+
+# Output directory for generated Excel reports and DDL JSON files.
+SCHEMA_AUDIT_OUTPUT_DIR = os.getenv("SCHEMA_AUDIT_OUTPUT_DIR", ".")

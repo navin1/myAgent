@@ -376,3 +376,331 @@ def get_table_mapping(table_name: str) -> dict[str, Any]:
         "available_tables": [v["table_name"] for v in _index.values()],
         "hint": "Call list_mapping_tables() to see all available specs",
     }
+
+
+# ---------------------------------------------------------------------------
+# Schema Audit — MySQL source → BigQuery target reconciliation
+# ---------------------------------------------------------------------------
+
+import json
+from datetime import datetime
+from typing import Optional
+
+from openpyxl import load_workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+
+# MySQL → expected BigQuery type mapping
+_MYSQL_TO_BQ: dict[str, str] = {
+    "int": "INT64", "bigint": "INT64", "smallint": "INT64",
+    "tinyint": "INT64", "mediumint": "INT64",
+    "float": "FLOAT64", "double": "FLOAT64",
+    "decimal": "NUMERIC",
+    "varchar": "STRING", "char": "STRING", "text": "STRING",
+    "longtext": "STRING", "mediumtext": "STRING", "tinytext": "STRING",
+    "datetime": "DATETIME", "timestamp": "TIMESTAMP",
+    "date": "DATE", "time": "TIME",
+    "boolean": "BOOL", "bool": "BOOL", "bit": "BOOL",
+    "json": "JSON",
+    "blob": "BYTES", "longblob": "BYTES", "mediumblob": "BYTES",
+}
+
+# BQ Standard SQL aliases → canonical form
+_BQ_ALIASES: dict[str, str] = {
+    "INTEGER": "INT64", "INT": "INT64", "SMALLINT": "INT64",
+    "BIGINT": "INT64", "BYTEINT": "INT64", "TINYINT": "INT64",
+    "FLOAT": "FLOAT64",
+    "DECIMAL": "NUMERIC", "BIGDECIMAL": "NUMERIC", "BIGNUMERIC": "NUMERIC",
+    "BOOLEAN": "BOOL",
+}
+
+_AUDIT_COLUMNS = [
+    "Column Name", "MySQL #", "BQ #",
+    "MySQL Type", "Expected BQ Type", "Actual BQ Type",
+    "BQ Description", "Status",
+]
+
+_STATUS_FILLS = {
+    "🟢": PatternFill("solid", fgColor="C6EFCE"),
+    "🟡": PatternFill("solid", fgColor="FFEB9C"),
+    "🟠": PatternFill("solid", fgColor="FF7518"),
+    "🔵": PatternFill("solid", fgColor="BDD7EE"),
+}
+
+
+def _mysql_to_bq(mysql_type: str) -> str:
+    return _MYSQL_TO_BQ.get(mysql_type.strip().lower(), mysql_type.strip().upper())
+
+
+def _canonical_bq(bq_type: str) -> str:
+    return _BQ_ALIASES.get(bq_type.strip().upper(), bq_type.strip().upper())
+
+
+def _audit_status(m: Optional[dict], b: Optional[dict], expected: str, actual: str) -> str:
+    if m is None:
+        return "🟠 BQ Only"
+    if b is None:
+        return "🔵 MySQL Only"
+    if actual and expected and _canonical_bq(actual) != _canonical_bq(expected):
+        return "🟡 Type Mismatch"
+    return "🟢 Match"
+
+
+def _safe_sheet_name(name: str, used: set[str]) -> str:
+    cleaned = re.sub(r"[\\\/\?\*\[\]:]", "_", name)[:31]
+    if cleaned not in used:
+        return cleaned
+    for i in range(2, 1000):
+        candidate = f"{cleaned[:31 - len(str(i)) - 1]}_{i}"
+        if candidate not in used:
+            return candidate
+    return cleaned
+
+
+def _fetch_mysql_metadata(client) -> "pd.DataFrame":
+    sql = f"""
+    SELECT
+        h.table_name, h.eda_dataset_name, h.eda_view_name, h.deployed_to_prod,
+        d.column_name, CAST(d.ordinal_position AS INT64) AS ordinal_position, d.data_type
+    FROM `{settings.SCHEMA_HEADER_VIEW}` h
+    JOIN `{settings.SCHEMA_DETAIL_VIEW}` d ON d.table_name = h.table_name
+    WHERE h.is_streamed = 1
+    ORDER BY h.table_name, d.ordinal_position
+    """
+    log.info("Querying MySQL metadata from BigQuery metadata views…")
+    df = client.query(sql).to_dataframe()
+    log.info("Retrieved %d column metadata rows.", len(df))
+    return df
+
+
+def _fetch_bq_schema(client, project: str, dataset: str, view: str) -> list[dict]:
+    full_ref = f"{project}.{dataset}.{view}"
+    try:
+        table_ref = client.get_table(full_ref)
+        return [
+            {
+                "column_name": field.name,
+                "ordinal_position": idx,
+                "data_type": field.field_type,
+                "description": field.description or "",
+            }
+            for idx, field in enumerate(table_ref.schema, 1)
+        ]
+    except Exception as exc:
+        log.warning("Could not fetch BQ schema for %s: %s", full_ref, exc)
+        return []
+
+
+def _reconcile(mysql_rows: list[dict], bq_rows: list[dict]) -> list[dict]:
+    mysql_map = {r["column_name"]: r for r in mysql_rows}
+    bq_map    = {r["column_name"]: r for r in bq_rows}
+    mysql_ordered = sorted(mysql_map, key=lambda c: mysql_map[c]["ordinal_position"])
+    bq_only = sorted(
+        (c for c in bq_map if c not in mysql_map),
+        key=lambda c: bq_map[c]["ordinal_position"],
+    )
+    rows = []
+    for col in mysql_ordered + bq_only:
+        m = mysql_map.get(col)
+        b = bq_map.get(col)
+        mysql_type  = m["data_type"].strip() if m else ""
+        actual_bq   = b["data_type"].strip() if b else ""
+        expected_bq = _mysql_to_bq(mysql_type) if mysql_type else ""
+        rows.append({
+            "Column Name":      col,
+            "MySQL #":          int(m["ordinal_position"]) if m else "",
+            "BQ #":             int(b["ordinal_position"]) if b else "",
+            "MySQL Type":       mysql_type,
+            "Expected BQ Type": expected_bq,
+            "Actual BQ Type":   actual_bq,
+            "BQ Description":   b["description"] if b else "",
+            "Status":           _audit_status(m, b, expected_bq, actual_bq),
+        })
+    return rows
+
+
+def _apply_audit_sheet_format(ws) -> None:
+    header_fill = PatternFill("solid", fgColor="4472C4")
+    header_font = Font(bold=True, color="FFFFFF", name="Calibri", size=11)
+    data_font   = Font(name="Courier New", size=11)
+    thin = Side(style="thin", color="BFBFBF")
+    cell_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    status_col = None
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.border = cell_border
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        if cell.value == "Status":
+            status_col = cell.column
+    col_widths: dict[int, int] = {}
+    for row in ws.iter_rows():
+        for cell in row:
+            length = len(str(cell.value)) if cell.value is not None else 0
+            col_widths[cell.column] = max(col_widths.get(cell.column, 0), length)
+            if cell.row > 1:
+                cell.font = data_font
+                cell.border = cell_border
+                cell.alignment = Alignment(vertical="center")
+                if status_col and cell.column == status_col:
+                    emoji = str(cell.value or "")[:2]
+                    fill = _STATUS_FILLS.get(emoji)
+                    if fill:
+                        cell.fill = fill
+    for col_idx, width in col_widths.items():
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(width + 3, 60)
+    ws.freeze_panes = "A2"
+    ws.row_dimensions[1].height = 18
+
+
+def _write_audit_excel(
+    meta_df: "pd.DataFrame",
+    tables: list[dict],
+    bq_project: str,
+    file_suffix: str,
+    client,
+    output_dir: str,
+    timestamp: str,
+) -> dict[str, Any]:
+    from pathlib import Path as _Path
+    output_file = str(_Path(output_dir) / f"schema_audit_{timestamp}_{file_suffix}.xlsx")
+    all_rows: list[dict] = []
+    table_dfs: dict[str, "pd.DataFrame"] = {}
+
+    for tbl in tables:
+        name    = tbl["table_name"]
+        dataset = tbl["eda_dataset_name"]
+        view    = tbl["eda_view_name"]
+        log.info("[%s] → %s.%s.%s", name, bq_project, dataset, view)
+        mysql_rows = (
+            meta_df[meta_df["table_name"] == name][
+                ["column_name", "ordinal_position", "data_type"]
+            ].to_dict("records")
+        )
+        bq_rows = _fetch_bq_schema(client, bq_project, dataset, view)
+        rows = _reconcile(mysql_rows, bq_rows)
+        table_dfs[name] = pd.DataFrame(rows, columns=_AUDIT_COLUMNS)
+        for row in rows:
+            all_rows.append({"Table Name": name, **row})
+
+    if not all_rows:
+        return {"error": f"No columns reconciled for {file_suffix}"}
+
+    summary_rows = [r for r in all_rows if not r["Status"].startswith("🟢")]
+    summary_df = pd.DataFrame(
+        summary_rows if summary_rows else [{}],
+        columns=["Table Name"] + _AUDIT_COLUMNS,
+    )
+    used_names: set[str] = {"Summary"}
+    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+        summary_df.to_excel(writer, sheet_name="Summary", index=False)
+        for tbl_name, df in table_dfs.items():
+            sheet = _safe_sheet_name(tbl_name, used_names)
+            used_names.add(sheet)
+            df.to_excel(writer, sheet_name=sheet, index=False)
+
+    wb = load_workbook(output_file)
+    for sheet_name in wb.sheetnames:
+        _apply_audit_sheet_format(wb[sheet_name])
+    wb.save(output_file)
+
+    total      = len(all_rows)
+    matches    = sum(1 for r in all_rows if r["Status"].startswith("🟢"))
+    mismatches = sum(1 for r in all_rows if r["Status"].startswith("🟡"))
+    bq_only    = sum(1 for r in all_rows if r["Status"].startswith("🟠"))
+    mysql_only = sum(1 for r in all_rows if r["Status"].startswith("🔵"))
+
+    return {
+        "output_file": output_file,
+        "tables": len(table_dfs),
+        "total_columns": total,
+        "match": matches,
+        "type_mismatch": mismatches,
+        "bq_only": bq_only,
+        "mysql_only": mysql_only,
+    }
+
+
+def _write_ddl_json(
+    meta_df: "pd.DataFrame",
+    tables: list[dict],
+    file_suffix: str,
+    output_dir: str,
+    timestamp: str,
+) -> str:
+    from pathlib import Path as _Path
+    output_file = str(_Path(output_dir) / f"schema_ddl_{timestamp}_{file_suffix}.json")
+    ddl: list[dict] = []
+    for tbl in tables:
+        name = tbl["table_name"]
+        cols = (
+            meta_df[meta_df["table_name"] == name]
+            .sort_values("ordinal_position")[["column_name", "data_type"]]
+            .to_dict("records")
+        )
+        ddl.append({
+            "Table": name,
+            "Schema": [
+                {"name": col["column_name"], "type": _mysql_to_bq(col["data_type"]), "mode": "NULLABLE"}
+                for col in cols
+            ],
+        })
+    with open(output_file, "w", encoding="utf-8") as fh:
+        json.dump(ddl, fh, indent=2)
+    return output_file
+
+
+def run_schema_audit() -> dict[str, Any]:
+    """
+    Run the full MySQL → BigQuery schema reconciliation audit.
+
+    Reads SCHEMA_METADATA_PROJECT, SCHEMA_BQ_PROJECT_PROD, SCHEMA_BQ_PROJECT_UAT,
+    SCHEMA_HEADER_VIEW, SCHEMA_DETAIL_VIEW, and SCHEMA_AUDIT_OUTPUT_DIR from .env.
+
+    Generates:
+      - schema_audit_<timestamp>_prd.xlsx  (prod tables)
+      - schema_audit_<timestamp>_uat.xlsx  (UAT tables)
+      - schema_ddl_<timestamp>_prd.json
+      - schema_ddl_<timestamp>_uat.json
+
+    Returns a summary dict with file paths and column-level stats.
+    """
+    if not settings.SCHEMA_METADATA_PROJECT:
+        return {"error": "SCHEMA_METADATA_PROJECT is not set in .env"}
+    if not settings.SCHEMA_HEADER_VIEW or not settings.SCHEMA_DETAIL_VIEW:
+        return {"error": "SCHEMA_HEADER_VIEW and SCHEMA_DETAIL_VIEW must be set in .env"}
+
+    from google.cloud import bigquery
+    client = bigquery.Client(project=settings.SCHEMA_METADATA_PROJECT)
+
+    meta_df = _fetch_mysql_metadata(client)
+    if meta_df.empty:
+        return {"error": "No streamed tables found in HEADER_VIEW"}
+
+    tbl_cols = ["table_name", "eda_dataset_name", "eda_view_name", "deployed_to_prod"]
+    all_tables  = meta_df[tbl_cols].drop_duplicates().to_dict("records")
+    prod_tables = [t for t in all_tables if t.get("deployed_to_prod") == 1]
+    uat_tables  = [t for t in all_tables if t.get("deployed_to_prod") != 1]
+
+    timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = settings.SCHEMA_AUDIT_OUTPUT_DIR
+    results: dict[str, Any] = {
+        "tables_found": len(all_tables),
+        "prod_tables": len(prod_tables),
+        "uat_tables": len(uat_tables),
+    }
+
+    if prod_tables and settings.SCHEMA_BQ_PROJECT_PROD:
+        results["prod"] = _write_audit_excel(
+            meta_df, prod_tables, settings.SCHEMA_BQ_PROJECT_PROD, "prd", client, output_dir, timestamp,
+        )
+        results["prod"]["ddl_json"] = _write_ddl_json(meta_df, prod_tables, "prd", output_dir, timestamp)
+
+    if uat_tables:
+        uat_project = settings.SCHEMA_BQ_PROJECT_UAT or settings.SCHEMA_METADATA_PROJECT
+        results["uat"] = _write_audit_excel(
+            meta_df, uat_tables, uat_project, "uat", client, output_dir, timestamp,
+        )
+        results["uat"]["ddl_json"] = _write_ddl_json(meta_df, uat_tables, "uat", output_dir, timestamp)
+
+    return results
