@@ -73,20 +73,29 @@ def _to_python(val: Any) -> Any:
     """Convert numpy/pandas types to plain Python for JSON serialisation."""
     if val is None:
         return None
-    if isinstance(val, float) and val != val:  # NaN
-        return None
+    # Catch all NA-like values: float NaN, pd.NA, pd.NaT, np.nan, etc.
+    try:
+        if pd.isna(val):
+            return None
+    except (TypeError, ValueError):
+        pass
     if isinstance(val, (np.integer,)):
         return int(val)
     if isinstance(val, (np.floating,)):
         return round(float(val), 4)
     if isinstance(val, (np.bool_,)):
         return bool(val)
+    if isinstance(val, pd.Timestamp):
+        return val.isoformat()
     if isinstance(val, (datetime.date, datetime.datetime)):
         return val.isoformat()
     if isinstance(val, decimal.Decimal):
         return float(val)
-    if isinstance(val, pd.Timestamp):
-        return val.isoformat()
+    if isinstance(val, (bytes, bytearray)):
+        return val.decode("utf-8", errors="replace")
+    # Fallback: if it's not a plain JSON-safe type, coerce to string
+    if not isinstance(val, (bool, int, float, str)):
+        return str(val)
     return val
 
 
@@ -297,3 +306,60 @@ def query_excel(sql: str) -> dict[str, Any]:
     except Exception as exc:
         log.warning("Excel SQL error: %s — %s", exc, sanitised[:200])
         return {"error": str(exc)}
+
+
+def show_excel_file(file_name: str, sheet_name: str = "") -> dict[str, Any]:
+    """
+    Show the full contents of an Excel file by its filename.
+    Looks up the internal DuckDB table name automatically — no need to know it in advance.
+
+    Args:
+        file_name:  Excel filename, e.g. "AAA.xlsx" or a partial match like "AAA".
+        sheet_name: Optional sheet name to narrow to a single sheet.
+    """
+    _ensure_loaded()
+
+    file_lower = file_name.lower().removesuffix(".xlsx").removesuffix(".xlsm").removesuffix(".xls")
+
+    matches = {
+        tbl: info for tbl, info in _registry.items()
+        if file_lower in Path(info["file"]).stem.lower()
+        and (not sheet_name or info["sheet"].lower() == sheet_name.lower())
+    }
+
+    if not matches:
+        available = sorted({Path(i["file"]).name for i in _registry.values()})
+        return {
+            "error": f"No Excel tables found matching '{file_name}'.",
+            "available_files": available,
+        }
+
+    results = []
+    for tbl, info in matches.items():
+        conn = _get_conn()
+        try:
+            cursor = conn.execute(f'SELECT * FROM "{tbl}"')
+            columns = [desc[0] for desc in cursor.description]
+            raw_rows = cursor.fetchall()
+            rows = [[_to_python(v) for v in row] for row in raw_rows]
+
+            truncated = False
+            if settings.MAX_SQL_ROWS > 0 and len(rows) > settings.MAX_SQL_ROWS:
+                rows = rows[: settings.MAX_SQL_ROWS]
+                truncated = True
+
+            results.append({
+                "columns": columns,
+                "rows": rows,
+                "row_count": len(rows),
+                "truncated": truncated,
+                "citation": {"file": info["file"], "sheet": info["sheet"]},
+            })
+        except Exception as exc:
+            results.append({"error": str(exc), "table": tbl})
+
+    # If only one sheet matched, return it directly so the UI renders the table
+    if len(results) == 1:
+        return results[0]
+
+    return {"sheets": results, "total_sheets": len(results)}

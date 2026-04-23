@@ -36,13 +36,15 @@ Rules:
 _EXCEL_SECTION = """
 ## Excel data (DuckDB)
 Tools:
+- show_excel_file(file_name, sheet_name?): show the full contents of an Excel file by filename — use this whenever the user asks to "show", "display", or "open" a file. No need to know the internal table name.
 - list_excel_files(): list all loaded Excel files and their sheets
 - list_excel_tables(): list all queryable tables with column names (call before querying)
 - get_excel_schema(table_name): get columns and row count for one table
 - query_excel(sql_query): DuckDB SQL SELECT against Excel tables; cross-file JOINs supported
 
 Rules:
-- Always call list_excel_tables() before querying if table names are unknown.
+- For "show / display / open file" requests always use show_excel_file(file_name) — never guess a table name.
+- Always call list_excel_tables() before query_excel if table names are unknown.
 - Every response containing Excel data MUST cite sources as: [filename.xlsx → SheetName]
 - The query result includes a `citations` field — include ALL of them in your response.
 - Only SELECT is allowed.""" if settings.EXCEL_DATA_PATH else ""
@@ -645,6 +647,10 @@ def estimate_sql_cost(sql_text: str) -> dict[str, Any]:
 if settings.EXCEL_DATA_PATH:
     import excel_service
 
+    def show_excel_file(file_name: str, sheet_name: str = "") -> dict[str, Any]:
+        """Show the full contents of an Excel file by its filename. Args: file_name: filename or partial match (e.g. 'AAA.xlsx'). sheet_name: optional sheet name to narrow results."""
+        return excel_service.show_excel_file(file_name, sheet_name)
+
     def list_excel_files() -> dict[str, Any]:
         """List all Excel files loaded from the data path with their sheet names."""
         return excel_service.list_excel_files()
@@ -662,7 +668,7 @@ if settings.EXCEL_DATA_PATH:
         sql = re.sub(r"```(?:sql)?\s*", "", sql_query).strip().strip("`")
         return excel_service.query_excel(sql)
 
-    _EXCEL_TOOLS: list = [list_excel_files, list_excel_tables, get_excel_schema, query_excel]
+    _EXCEL_TOOLS: list = [show_excel_file, list_excel_files, list_excel_tables, get_excel_schema, query_excel]
 else:
     _EXCEL_TOOLS = []
 
@@ -952,7 +958,7 @@ class MyAgent:
                     types.Part.from_function_response(name=fn_name, response=llm_result)
                 )
 
-            self.history.append(types.Content(role="tool", parts=response_parts))
+            self.history.append(types.Content(role="user", parts=response_parts))
 
         return result
 
