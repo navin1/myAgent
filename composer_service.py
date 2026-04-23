@@ -34,9 +34,27 @@ def _environment_resource_name() -> str:
     )
 
 
+def _composer_rest_session():
+    """Return a requests.Session with a fresh GCP Bearer token (cloud-platform scope)."""
+    import requests
+    import google.auth
+    import google.auth.transport.requests as google_requests
+
+    credentials, _ = google.auth.default(
+        scopes=["https://www.googleapis.com/auth/cloud-platform"]
+    )
+    credentials.refresh(google_requests.Request())
+    session = requests.Session()
+    session.headers.update({
+        "Authorization": f"Bearer {credentials.token}",
+        "Content-Type": "application/json",
+    })
+    return session
+
+
 def list_composer_environments(location: str = "") -> dict[str, Any]:
     """
-    List all Composer environments in the configured project.
+    List all Composer environments in the configured project via the Composer REST API.
 
     Args:
         location: GCP region (e.g. "us-central1"). Defaults to COMPOSER_LOCATION.
@@ -44,30 +62,41 @@ def list_composer_environments(location: str = "") -> dict[str, Any]:
     """
     if not settings.COMPOSER_PROJECT_ID:
         return {"error": "COMPOSER_PROJECT_ID is not configured"}
+
     loc = location or settings.COMPOSER_LOCATION or "-"
-    parent = f"projects/{settings.COMPOSER_PROJECT_ID}/locations/{loc}"
+    url = (
+        f"https://composer.googleapis.com/v1/projects"
+        f"/{settings.COMPOSER_PROJECT_ID}/locations/{loc}/environments"
+    )
     try:
-        from google.cloud.orchestration.airflow.service_v1 import EnvironmentsClient
-        client = EnvironmentsClient()
-        envs = list(client.list_environments(parent=parent))
+        import requests as _requests
+        session = _composer_rest_session()
+        resp = session.get(url, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+
         results = []
-        for env in envs:
-            name_parts = env.name.split("/")
+        for env in data.get("environments", []):
+            name_parts = env.get("name", "").split("/")
+            cfg = env.get("config", {})
             results.append({
-                "name": name_parts[-1] if name_parts else env.name,
-                "full_name": env.name,
+                "name": name_parts[-1] if name_parts else env.get("name", ""),
                 "location": name_parts[-3] if len(name_parts) >= 3 else loc,
-                "state": env.state.name,
-                "airflow_uri": env.config.airflow_uri,
-                "gcs_dag_prefix": env.config.dag_gcs_prefix,
+                "state": env.get("state", ""),
+                "airflow_uri": cfg.get("airflowUri", ""),
+                "gcs_dag_prefix": cfg.get("dagGcsPrefix", ""),
             })
+
         return {
             "project": settings.COMPOSER_PROJECT_ID,
             "location": loc,
             "environments": results,
             "total": len(results),
+            "columns": ["name", "location", "state", "airflow_uri", "gcs_dag_prefix"],
+            "rows": [[r["name"], r["location"], r["state"], r["airflow_uri"], r["gcs_dag_prefix"]] for r in results],
         }
     except Exception as exc:
+        log.warning("list_composer_environments error: %s", exc)
         return {"error": str(exc)}
 
 
