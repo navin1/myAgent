@@ -25,13 +25,6 @@ EXCEL_MAPPING_PATH        = os.getenv("EXCEL_MAPPING_PATH", "")
 EXCEL_MASTER_HEADER_ROWS  = int(os.getenv("EXCEL_MASTER_HEADER_ROWS", "1"))
 EXCEL_MAPPING_HEADER_ROWS = int(os.getenv("EXCEL_MAPPING_HEADER_ROWS", "2"))
 
-# Composer V3 – targeted environment connection
-COMPOSER_PROJECT_ID  = os.getenv("COMPOSER_PROJECT_ID", GCP_PROJECT_ID)
-COMPOSER_LOCATION    = os.getenv("COMPOSER_LOCATION", VERTEX_LOCATION)
-COMPOSER_ENVIRONMENT = os.getenv("COMPOSER_ENVIRONMENT", "")
-COMPOSER_DAG_BUCKET  = os.getenv("COMPOSER_DAG_BUCKET", "")  # leave blank to auto-discover via API
-AIRFLOW_API_TIMEOUT  = int(os.getenv("AIRFLOW_API_TIMEOUT", "30"))  # seconds
-
 # GCS – SQL transformation scripts
 SQL_GCS_BUCKET = os.getenv("SQL_GCS_BUCKET", "")
 SQL_GCS_PREFIX = os.getenv("SQL_GCS_PREFIX", "")  # e.g. "sql/transformations/"
@@ -39,29 +32,6 @@ SQL_GCS_PREFIX = os.getenv("SQL_GCS_PREFIX", "")  # e.g. "sql/transformations/"
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
 LOG_LEVEL          = os.getenv("LOG_LEVEL", "INFO")
-
-# ── Git Repository ────────────────────────────────────────────────────────────
-# Remote URL (HTTPS or SSH).  Leave blank to use a pre-existing local clone only.
-GIT_REPO_URL   = os.getenv("GIT_REPO_URL", "")
-
-# Branch to checkout and push to (leave blank to use the repo default branch).
-GIT_BRANCH     = os.getenv("GIT_BRANCH", "main")
-
-# Absolute path where the repo is (or will be) cloned on this machine.
-GIT_LOCAL_PATH = os.getenv("GIT_LOCAL_PATH", "/tmp/dbconnect_git_repo")
-
-# Personal Access Token for HTTPS auth.  Omit when using SSH key auth.
-GIT_TOKEN      = os.getenv("GIT_TOKEN", "")
-
-# Subdirectory inside the repo that holds Airflow DAG (.py) files.
-GIT_DAG_PATH   = os.getenv("GIT_DAG_PATH", "dags/")
-
-# Subdirectory inside the repo that holds SQL transformation (.sql) files.
-GIT_SQL_PATH   = os.getenv("GIT_SQL_PATH", "sql/")
-
-# Committer identity used when writing back optimised files.
-GIT_COMMIT_USER_NAME  = os.getenv("GIT_COMMIT_USER_NAME", "MyAgent")
-GIT_COMMIT_USER_EMAIL = os.getenv("GIT_COMMIT_USER_EMAIL", "dbconnect@example.com")
 
 # ── Schema Audit (MySQL → BigQuery reconciliation) ────────────────────────────
 # GCP project that hosts the HEADER_VIEW and DETAIL_VIEW metadata tables.
