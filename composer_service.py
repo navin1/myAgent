@@ -34,6 +34,43 @@ def _environment_resource_name() -> str:
     )
 
 
+def list_composer_environments(location: str = "") -> dict[str, Any]:
+    """
+    List all Composer environments in the configured project.
+
+    Args:
+        location: GCP region (e.g. "us-central1"). Defaults to COMPOSER_LOCATION.
+                  Pass "-" to list across all regions.
+    """
+    if not settings.COMPOSER_PROJECT_ID:
+        return {"error": "COMPOSER_PROJECT_ID is not configured"}
+    loc = location or settings.COMPOSER_LOCATION or "-"
+    parent = f"projects/{settings.COMPOSER_PROJECT_ID}/locations/{loc}"
+    try:
+        from google.cloud.orchestration.airflow.service_v1 import EnvironmentsClient
+        client = EnvironmentsClient()
+        envs = list(client.list_environments(parent=parent))
+        results = []
+        for env in envs:
+            name_parts = env.name.split("/")
+            results.append({
+                "name": name_parts[-1] if name_parts else env.name,
+                "full_name": env.name,
+                "location": name_parts[-3] if len(name_parts) >= 3 else loc,
+                "state": env.state.name,
+                "airflow_uri": env.config.airflow_uri,
+                "gcs_dag_prefix": env.config.dag_gcs_prefix,
+            })
+        return {
+            "project": settings.COMPOSER_PROJECT_ID,
+            "location": loc,
+            "environments": results,
+            "total": len(results),
+        }
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
 def get_composer_environment() -> dict[str, Any]:
     """Return metadata for the configured Composer V3 environment."""
     if err := _requires_composer():

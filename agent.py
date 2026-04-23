@@ -104,6 +104,7 @@ _COMPOSER_SECTION = (f"""
 ## Airflow Composer V3  (environment: {settings.COMPOSER_ENVIRONMENT or "not configured"})
 
 ### GCS-based tools (work with COMPOSER_DAG_BUCKET only)
+- list_composer_environments(location?): list ALL Composer environments in the project; call this when the user asks to "list composers" or "show all environments". location defaults to COMPOSER_LOCATION; pass "-" for all regions.
 - get_composer_environment(): verify connectivity; returns state, Airflow URI, and GCS DAG bucket
 - list_dag_files(): list all DAG Python (.py) files in the Composer GCS DAGs folder
 - find_dag_for_table(table_name): full-text search DAG files for table references
@@ -735,6 +736,10 @@ if settings.COMPOSER_ENVIRONMENT or settings.COMPOSER_DAG_BUCKET:
 
     # ── GCS-based tools (available with either COMPOSER_ENVIRONMENT or COMPOSER_DAG_BUCKET) ──
 
+    def list_composer_environments(location: str = "") -> dict[str, Any]:
+        """List all Composer environments in the configured project. Args: location: GCP region (default: COMPOSER_LOCATION). Pass '-' for all regions."""
+        return composer_service.list_composer_environments(location)
+
     def get_composer_environment() -> dict[str, Any]:
         """Get metadata for the configured Composer V3 environment (state, GCS DAG bucket, Airflow URI)."""
         return composer_service.get_composer_environment()
@@ -752,7 +757,8 @@ if settings.COMPOSER_ENVIRONMENT or settings.COMPOSER_DAG_BUCKET:
         return composer_service.read_dag_file(dag_file_path)
 
     _COMPOSER_TOOLS: list = [
-        get_composer_environment, list_dag_files, find_dag_for_table, read_dag_file
+        list_composer_environments, get_composer_environment,
+        list_dag_files, find_dag_for_table, read_dag_file,
     ]
 
     # ── Airflow REST API tools (require COMPOSER_ENVIRONMENT to resolve the Airflow URI) ──
