@@ -113,7 +113,8 @@ _COMPOSER_SECTION = (f"""
 - read_dag_file(dag_file_path): read the raw Python source of a DAG file from GCS
 
 ### Airflow REST API tools (require COMPOSER_ENVIRONMENT; return live/rendered data)
-- list_airflow_dags(): list all DAGs registered in Airflow with pause state and tags
+- list_dags_for_environment(environment_name): list all DAGs for a NAMED Composer environment — use this whenever the user specifies an environment by name (e.g. "list DAGs for composer xyz"). Resolves the Airflow URI automatically.
+- list_airflow_dags(): list all DAGs for the DEFAULT configured environment
 - get_dag_source(dag_id): **primary DAG code tool** — resolves the dag_id to its GCS file path
   via the Airflow API and returns the full Python source; use this for DAG optimization
 - list_dag_tasks(dag_id): list every task in a DAG with its operator class, template fields,
@@ -762,9 +763,14 @@ if settings.COMPOSER_ENVIRONMENT or settings.COMPOSER_DAG_BUCKET:
         """Read a Composer DAG file from GCS. Args: dag_file_path: blob path from list_dag_files."""
         return composer_service.read_dag_file(dag_file_path)
 
+    def list_dags_for_environment(environment_name: str) -> dict[str, Any]:
+        """List all DAGs for a named Composer environment. Resolves the Airflow URI automatically. Args: environment_name: Composer environment name, e.g. 'xyz'."""
+        return composer_service.list_dags_for_environment(environment_name)
+
     _COMPOSER_TOOLS: list = [
         list_composer_environments, get_composer_environment,
         list_dag_files, find_dag_for_table, read_dag_file,
+        list_dags_for_environment,
     ]
 
     # ── Airflow REST API tools (require COMPOSER_ENVIRONMENT to resolve the Airflow URI) ──
@@ -773,7 +779,7 @@ if settings.COMPOSER_ENVIRONMENT or settings.COMPOSER_DAG_BUCKET:
         import airflow_service
 
         def list_airflow_dags() -> dict[str, Any]:
-            """List all DAGs in the Airflow environment with pause state and tags."""
+            """List all DAGs in the default configured Airflow environment with pause state and tags."""
             return airflow_service.list_airflow_dags()
 
         def get_dag_source(dag_id: str) -> dict[str, Any]:

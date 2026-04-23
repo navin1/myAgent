@@ -100,6 +100,71 @@ def list_composer_environments(location: str = "") -> dict[str, Any]:
         return {"error": str(exc)}
 
 
+def _resolve_airflow_uri(environment_name: str) -> str:
+    """
+    Return the Airflow web server URI for *environment_name* by searching all
+    environments in the configured project. Raises RuntimeError if not found.
+    """
+    data = list_composer_environments(location="-")
+    if "error" in data:
+        raise RuntimeError(data["error"])
+    name_lower = environment_name.lower()
+    for env in data.get("environments", []):
+        if env["name"].lower() == name_lower:
+            uri = env.get("airflow_uri", "")
+            if not uri:
+                raise RuntimeError(
+                    f"Environment '{environment_name}' found but airflow_uri is empty. "
+                    "The environment may still be initialising."
+                )
+            return uri.rstrip("/")
+    available = [e["name"] for e in data.get("environments", [])]
+    raise RuntimeError(
+        f"No Composer environment named '{environment_name}' found in project "
+        f"'{settings.COMPOSER_PROJECT_ID}'. Available: {available}"
+    )
+
+
+def list_dags_for_environment(environment_name: str, limit: int = 200) -> dict[str, Any]:
+    """
+    List all DAGs registered in a named Composer environment.
+    Resolves the Airflow URI automatically from the environment name.
+
+    Args:
+        environment_name: Composer environment name (e.g. "xyz"). Case-insensitive.
+        limit: max number of DAGs to return (default 200).
+    """
+    if not settings.COMPOSER_PROJECT_ID:
+        return {"error": "COMPOSER_PROJECT_ID is not configured"}
+    try:
+        airflow_uri = _resolve_airflow_uri(environment_name)
+        session = _composer_rest_session()
+        url = f"{airflow_uri}/api/v1/dags?limit={limit}&order_by=dag_id"
+        resp = session.get(url, timeout=settings.AIRFLOW_API_TIMEOUT)
+        resp.raise_for_status()
+        raw = resp.json()
+        dags = [
+            {
+                "dag_id": d["dag_id"],
+                "is_paused": d.get("is_paused", False),
+                "tags": [t["name"] for t in d.get("tags", [])],
+                "description": d.get("description") or "",
+            }
+            for d in raw.get("dags", [])
+        ]
+        return {
+            "environment": environment_name,
+            "airflow_uri": airflow_uri,
+            "dags": dags,
+            "total": raw.get("total_entries", len(dags)),
+            "columns": ["dag_id", "is_paused", "tags", "description"],
+            "rows": [[d["dag_id"], d["is_paused"], ", ".join(d["tags"]), d["description"]] for d in dags],
+        }
+    except Exception as exc:
+        log.warning("list_dags_for_environment(%s) error: %s", environment_name, exc)
+        return {"error": str(exc)}
+
+
 def get_composer_environment() -> dict[str, Any]:
     """Return metadata for the configured Composer V3 environment."""
     if err := _requires_composer():
